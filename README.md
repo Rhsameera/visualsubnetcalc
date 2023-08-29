@@ -2,7 +2,7 @@
 
 ![demo.gif](src%2Fdemo.gif)
 
-Visual Subnet Calculator is a modernized tool based on the original work by [davidc](https://github.com/davidc/subnets).
+Visual Subnet Calculator is a modernized tool based on the original work by [davidc](https://github.com/davidc/subnets) and [ckabalan](https://github.com/ckabalan/visualsubnetcalc).
 It strives to be a tool for quickly designing networks and collaborating on that design with others. It focuses on
 expediting the work of network administrators, not academic subnetting math.
 
@@ -32,7 +32,7 @@ Compile from source:
 
 ```shell
 # Clone the repository
-> git clone https://github.com/ckabalan/visualsubnetcalc
+> git clone https://github.com/Rhsameera/visualsubnetcalc.git
 # Use recommended NVM version
 > nvm use
 # Change to the sources directory
