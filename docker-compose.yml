@@ -1,0 +1,9 @@
+version: '3.2'
+
+services:
+  visualsubnet:
+    build:
+      dockerfile: Dockerfile
+      context: .
+    networks:
+      - internal-app-network
