@@ -1,9 +1,26 @@
-FROM alpine:latest
+FROM node:20-alpine as build
 
-RUN apk update
-RUN apk add lighttpd
-RUN rm -rf /var/cache/apk/*
+ARG REACT_APP_SERVICES_HOST=/services/m
 
-COPY dist/ /var/www/localhost/htdocs
+# Set working directory and copy only package files for better cache utilization
+WORKDIR /app/src
+COPY src/package*.json /app/src/
 
-CMD ["lighttpd","-D","-f","/etc/lighttpd/lighttpd.conf"]
+# Install dependencies
+RUN npm install
+
+# Copy the rest of the application code
+COPY . /app
+
+# Build the application
+RUN npm run build
+
+# Use a specific version of nginx
+# https://hub.docker.com/r/nginxinc/nginx-unprivileged
+FROM nginxinc/nginx-unprivileged:stable-alpine
+
+# Copy built assets from the build stage
+COPY --from=build /app/dist /usr/share/nginx/html
+
+# Set a non-root user
+USER nginx
