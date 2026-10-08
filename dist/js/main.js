@@ -2,6 +2,10 @@ let subnetMap = {};
 let subnetNotes = {};
 let maxNetSize = 0;
 let infoColumnCount = 5
+let showNetmask = false
+let undoStack = []
+let redoStack = []
+let currentSnapshot = ''
 // NORMAL mode:
 //   - Smallest subnet: /32
 //   - Two reserved addresses per subnet of size <= 30:
@@ -38,6 +42,7 @@ $('#calcbody').on('click', '.row_address, .row_range, .row_usable, .row_hosts, .
         // We could re-render here, but there is really no point, keep performant and just change the background color now
         //renderTable();
         $(this).closest('tr').css('background-color', inflightColor)
+        commit_history()
     }
 })
 
@@ -118,13 +123,39 @@ function reset() {
     subnetMap = {}
     subnetMap[rootCidr] = {}
     maxNetSize = parseInt($('#netsize').val())
+    commit_history()
     renderTable();
 }
 
 $('#calcbody').on('click', 'td.split,td.join', function(event) {
     // HTML DOM Data elements! Yay! See the `data-*` attributes of the HTML tags
     mutate_subnet_map(this.dataset.mutateVerb, this.dataset.subnet, '')
+    commit_history()
     renderTable();
+})
+
+// Right-click a Split cell to split a subnet into several equal pieces at once.
+let splitTargetSubnet = ''
+$('#calcbody').on('contextmenu', 'td.split', function(event) {
+    let parts = this.dataset.subnet.split('/')
+    let netSize = parseInt(parts[1])
+    let options = ''
+    for (let bits = 1; bits <= 8 && netSize + bits <= minSubnetSize; bits++) {
+        options += '<option value="' + (netSize + bits) + '">' + (2 ** bits) + ' x /' + (netSize + bits) + '</option>'
+    }
+    if (options === '') { return }
+    event.preventDefault()
+    splitTargetSubnet = this.dataset.subnet
+    $('#splitSubnetLabel').text(splitTargetSubnet)
+    $('#splitSizeSelect').html(options)
+    bootstrap.Modal.getOrCreateInstance(document.getElementById('splitModal')).show()
+})
+
+$('#splitConfirmBtn').on('click', function() {
+    split_network_to(splitTargetSubnet, parseInt($('#splitSizeSelect').val()))
+    commit_history()
+    renderTable()
+    bootstrap.Modal.getOrCreateInstance(document.getElementById('splitModal')).hide()
 })
 
 $('#calcbody').on('keyup', 'td.note input', function(event) {
@@ -133,6 +164,7 @@ $('#calcbody').on('keyup', 'td.note input', function(event) {
     clearTimeout(noteTimeout);
     noteTimeout = setTimeout(function(element) {
         mutate_subnet_map('note', element.dataset.subnet, '', element.value)
+        commit_history()
     }, delay, this);
 })
 
@@ -140,11 +172,13 @@ $('#calcbody').on('focusout', 'td.note input', function(event) {
     // HTML DOM Data elements! Yay! See the `data-*` attributes of the HTML tags
     clearTimeout(noteTimeout);
     mutate_subnet_map('note', this.dataset.subnet, '', this.value)
+    commit_history()
 })
 
 
 function renderTable() {
-    // TODO: Validation Code
+    infoColumnCount = showNetmask ? 6 : 5
+    $('#netmaskHeader').css('display', showNetmask ? 'table-cell' : 'none')
     $('#calcbody').empty();
     let maxDepth = get_dict_max_depth(subnetMap, 0)
     addRowTree(subnetMap, 0, maxDepth)
@@ -196,6 +230,7 @@ function addRow(network, netSize, colspan, note, notesWidth, color) {
     let newRow =
         '            <tr id="row_' + network.replace('.', '-') + '_' + netSize + '"' + styleTag + '>\n' +
         '                <td data-subnet="' + network + '/' + netSize + '" class="row_address">' + network + '/' + netSize + '</td>\n' +
+        (showNetmask ? '                <td data-subnet="' + network + '/' + netSize + '" class="row_netmask">' + netmask_text(netSize) + '</td>\n' : '') +
         '                <td data-subnet="' + network + '/' + netSize + '" class="row_range">' + rangeCol + '</td>\n' +
         '                <td data-subnet="' + network + '/' + netSize + '" class="row_usable">' + usableCol + '</td>\n' +
         '                <td data-subnet="' + network + '/' + netSize + '" class="row_hosts">' + hostCount + '</td>\n' +
@@ -582,6 +617,8 @@ function importConfig(text) {
         $('#network').val(subnet_split[0])
         $('#netsize').val(subnet_split[1])
         subnetMap = text['subnets'];
+        maxNetSize = parseInt(subnet_split[1])
+        commit_history()
         renderTable()
         return true
     } catch (e) {
@@ -595,4 +632,142 @@ $('#btn_aws_mode').on('click', function(event) {
     operatingMode = (operatingMode === 'AWS') ? 'NORMAL' : 'AWS'
     $('#aws_mode_state').text(operatingMode === 'AWS' ? 'on' : 'off')
     reset()
+})
+
+// Netmask / wildcard column
+function netmask_text(netSize) {
+    let mask = netSize === 0 ? 0 : (0xFFFFFFFF << (32 - netSize)) >>> 0
+    return int2ip(mask) + ' / ' + int2ip(~mask >>> 0)
+}
+
+$('#btn_netmask').on('click', function(event) {
+    event.preventDefault()
+    showNetmask = !showNetmask
+    $('#netmask_state').text(showNetmask ? 'on' : 'off')
+    renderTable()
+})
+
+// Undo / redo: snapshots of the whole subnet tree
+function commit_history() {
+    let snapshot = JSON.stringify(subnetMap)
+    if (snapshot === currentSnapshot) { return }
+    if (currentSnapshot !== '') {
+        undoStack.push(currentSnapshot)
+        if (undoStack.length > 100) { undoStack.shift() }
+    }
+    currentSnapshot = snapshot
+    redoStack = []
+    update_history_buttons()
+}
+
+function restore_snapshot(snapshot) {
+    currentSnapshot = snapshot
+    subnetMap = JSON.parse(snapshot)
+    let rootSplit = Object.keys(subnetMap)[0].split('/')
+    maxNetSize = parseInt(rootSplit[1])
+    $('#network').val(rootSplit[0])
+    $('#netsize').val(rootSplit[1])
+    renderTable()
+    update_history_buttons()
+}
+
+function undo() {
+    if (undoStack.length === 0) { return }
+    redoStack.push(currentSnapshot)
+    restore_snapshot(undoStack.pop())
+}
+
+function redo() {
+    if (redoStack.length === 0) { return }
+    undoStack.push(currentSnapshot)
+    restore_snapshot(redoStack.pop())
+}
+
+function update_history_buttons() {
+    $('#btn_undo').toggleClass('disabled', undoStack.length === 0)
+    $('#btn_redo').toggleClass('disabled', redoStack.length === 0)
+}
+
+$('#btn_undo').on('click', function(event) { event.preventDefault(); undo() })
+$('#btn_redo').on('click', function(event) { event.preventDefault(); redo() })
+
+$(document).on('keydown', function(event) {
+    if (!(event.ctrlKey || event.metaKey)) { return }
+    // Leave text editing inside inputs/textareas to the browser
+    if ($(event.target).is('input, textarea')) { return }
+    let key = event.key.toLowerCase()
+    if (key === 'z' && !event.shiftKey) { event.preventDefault(); undo() }
+    else if (key === 'y' || (key === 'z' && event.shiftKey)) { event.preventDefault(); redo() }
+})
+
+// Split a subnet into equal pieces of the target size
+function split_network_to(cidr, targetSize) {
+    let level = [cidr]
+    while (level.length > 0 && parseInt(level[0].split('/')[1]) < targetSize) {
+        let next = []
+        for (const net of level) {
+            let parts = net.split('/')
+            mutate_subnet_map('split', net, '')
+            next.push(...split_network(parts[0], parseInt(parts[1])))
+        }
+        level = next
+    }
+}
+
+// Table export (CSV / Markdown / JSON file)
+function get_table_data() {
+    let rows = [['Subnet', 'Range', 'Usable', 'Hosts', 'Note']]
+    if (showNetmask) { rows[0].splice(1, 0, 'Netmask / Wildcard') }
+    $('#calcbody tr').each(function() {
+        let row = [$(this).find('.row_address').text()]
+        if (showNetmask) { row.push($(this).find('.row_netmask').text()) }
+        row.push($(this).find('.row_range').text(), $(this).find('.row_usable').text(), $(this).find('.row_hosts').text(), $(this).find('td.note input').val())
+        rows.push(row)
+    })
+    return rows
+}
+
+function to_csv(rows) {
+    return rows.map(function(row) {
+        return row.map(function(cell) {
+            cell = String(cell)
+            // Prevent spreadsheet formula injection from notes
+            if (/^[=+\-@\t\r]/.test(cell)) { cell = "'" + cell }
+            return '"' + cell.replace(/"/g, '""') + '"'
+        }).join(',')
+    }).join('\r\n') + '\r\n'
+}
+
+function to_markdown(rows) {
+    let esc = function(cell) { return String(cell).replace(/\|/g, '\\|').replace(/\r?\n/g, ' ') }
+    let lines = ['| ' + rows[0].map(esc).join(' | ') + ' |', '| ' + rows[0].map(function() { return '---' }).join(' | ') + ' |']
+    rows.slice(1).forEach(function(row) { lines.push('| ' + row.map(esc).join(' | ') + ' |') })
+    return lines.join('\n') + '\n'
+}
+
+function download_file(filename, content, mime) {
+    let url = URL.createObjectURL(new Blob([content], {type: mime}))
+    let link = document.createElement('a')
+    link.href = url
+    link.download = filename
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    URL.revokeObjectURL(url)
+}
+
+$('#btn_export_csv').on('click', function() { download_file('subnets.csv', to_csv(get_table_data()), 'text/csv') })
+$('#btn_export_json').on('click', function() { download_file('subnets.json', JSON.stringify(exportConfig(), null, 2), 'application/json') })
+$('#btn_copy_markdown').on('click', function() {
+    navigator.clipboard.writeText(to_markdown(get_table_data()))
+    $('#btn_copy_markdown').text('Copied!')
+    setTimeout(function() { $('#btn_copy_markdown').text('Copy Markdown') }, 2000)
+})
+$('#importFile').on('change', function() {
+    let file = this.files[0]
+    if (!file) { return }
+    let reader = new FileReader()
+    reader.onload = function() { $('#importExportArea').val(reader.result) }
+    reader.readAsText(file)
+    this.value = ''
 })
