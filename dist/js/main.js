@@ -55,7 +55,7 @@ $('#importBtn').on('click', function() {
     try {
         parsed = JSON.parse($('#importExportArea').val())
     } catch (e) {
-        show_warning_modal('The pasted text is not valid JSON.')
+        report_import_error('The pasted text is not valid JSON.')
         return
     }
     if (importConfig(parsed)) {
@@ -91,6 +91,7 @@ $('#bottom_nav #copy_url').on('click', function() {
 
 
 $('#btn_import_export').on('click', function() {
+    $('#importError').addClass('d-none')
     $('#importExportArea').val(JSON.stringify(exportConfig(), null, 2))
 })
 
@@ -603,6 +604,15 @@ function renameKey(obj, oldKey, newKey) {
     }
 }
 
+// Bootstrap would stack a second modal behind the Import dialog, so show errors inline there.
+function report_import_error(message) {
+    if ($('#importExportModal').hasClass('show')) {
+        $('#importError').text(message).removeClass('d-none')
+    } else {
+        show_warning_modal(escapeHtml(message))
+    }
+}
+
 function importConfig(text) {
     try {
         if (typeof text !== 'object' || text === null || text['config_version'] !== '1') {
@@ -622,7 +632,7 @@ function importConfig(text) {
         renderTable()
         return true
     } catch (e) {
-        show_warning_modal('Import failed: ' + escapeHtml(e.message))
+        report_import_error('Import failed: ' + e.message)
         return false
     }
 }
@@ -633,6 +643,8 @@ $('#btn_aws_mode').on('click', function(event) {
     $('#aws_mode_state').text(operatingMode === 'AWS' ? 'on' : 'off')
     reset()
 })
+
+const rgba2hex = (rgba) => `#${rgba.match(/^rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*(\d+\.{0,1}\d*))?\)$/).slice(1).map((n, i) => (i === 3 ? Math.round(parseFloat(n) * 255) : parseFloat(n)).toString(16).padStart(2, '0').replace('NaN', '')).join('')}`
 
 // Netmask / wildcard column
 function netmask_text(netSize) {
