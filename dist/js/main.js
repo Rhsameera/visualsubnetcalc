@@ -46,7 +46,16 @@ $('#btn_go').on('click', function() {
 })
 
 $('#importBtn').on('click', function() {
-    importConfig(JSON.parse($('#importExportArea').val()))
+    let parsed
+    try {
+        parsed = JSON.parse($('#importExportArea').val())
+    } catch (e) {
+        show_warning_modal('The pasted text is not valid JSON.')
+        return
+    }
+    if (importConfig(parsed)) {
+        bootstrap.Modal.getInstance(document.getElementById('importExportModal'))?.hide()
+    }
 })
 
 $('#bottom_nav #colors_word_open').on('click', function() {
@@ -63,8 +72,10 @@ $('#bottom_nav #colors_word_close').on('click', function() {
 })
 
 $('#bottom_nav #copy_url').on('click', function() {
-    // TODO: Provide a warning here if the URL is longer than 2000 characters, probably using a modal.
     let url = window.location.origin + getConfigUrl()
+    if (url.length > 2000) {
+        show_warning_modal('This shareable URL is ' + url.length + ' characters long. Some browsers, servers and chat tools truncate URLs over 2000 characters, so the link may not work. Use Tools &gt; Import / Export to share the design as JSON instead.')
+    }
     navigator.clipboard.writeText(url);
     $('#bottom_nav #copy_url span').text('Copied!')
     // Swap the text back after 3sec
@@ -84,6 +95,19 @@ function reset() {
     } else {
         minSubnetSize = 32
     }
+    let maxRootSize = Math.min(30, minSubnetSize)
+    let networkValue = $('#network').val().trim()
+    let netsizeValue = $('#netsize').val().trim()
+    if (!is_valid_ipv4(networkValue)) {
+        show_warning_modal('Please enter a valid IPv4 network address, e.g. <span class="font-monospace">10.0.0.0</span>.')
+        return
+    }
+    if (!/^\d{1,2}$/.test(netsizeValue) || parseInt(netsizeValue) > maxRootSize) {
+        show_warning_modal('Network size must be a number between 0 and ' + maxRootSize + (operatingMode === 'AWS' ? ' in AWS mode.' : '.'))
+        return
+    }
+    $('#network').val(networkValue)
+    $('#netsize').val(parseInt(netsizeValue))
     let cidrInput = $('#network').val() + '/' + $('#netsize').val()
     let rootNetwork = get_network($('#network').val(), $('#netsize').val())
     let rootCidr = rootNetwork + '/' + $('#netsize').val()
@@ -155,9 +179,10 @@ function addRow(network, netSize, colspan, note, notesWidth, color) {
     let usableLast = subnet_usable_last(addressFirst, netSize)
     let hostCount = 1 + usableLast - usableFirst
     let styleTag = ''
-    if (color !== '') {
+    if (is_valid_color(color)) {
         styleTag = ' style="background-color: ' + color + '"'
     }
+    note = escapeHtml(note)
 
     let rangeCol, usableCol;
     if (netSize < 32) {
@@ -196,6 +221,48 @@ function addRow(network, netSize, colspan, note, notesWidth, color) {
 
 
 // Helper Functions
+function escapeHtml(value) {
+    return String(value).replace(/[&<>"']/g, function(c) {
+        return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]
+    })
+}
+
+function is_valid_ipv4(ip) {
+    return /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/.test(ip)
+}
+
+function is_valid_cidr(cidr) {
+    if (typeof cidr !== 'string') { return false }
+    let parts = cidr.split('/')
+    return parts.length === 2 && is_valid_ipv4(parts[0]) && /^\d{1,2}$/.test(parts[1]) && parseInt(parts[1]) <= 32
+}
+
+function is_valid_color(color) {
+    return typeof color === 'string' && /^#[0-9a-fA-F]{3,8}$/.test(color)
+}
+
+// Throws if the (decoded) config tree is malformed, so bad imports/URLs can never reach the renderer.
+function validate_subnet_tree(tree, isRoot) {
+    if (typeof tree !== 'object' || tree === null || Array.isArray(tree)) {
+        throw new Error('Invalid subnet structure.')
+    }
+    let keys = Object.keys(tree)
+    if (isRoot && keys.length !== 1) {
+        throw new Error('Configuration must have exactly one root network.')
+    }
+    for (const key of keys) {
+        if (key === '_note') {
+            if (typeof tree[key] !== 'string') { throw new Error('Invalid note.') }
+        } else if (key === '_color') {
+            if (tree[key] !== '' && !is_valid_color(tree[key])) { throw new Error('Invalid color.') }
+        } else if (is_valid_cidr(key)) {
+            validate_subnet_tree(tree[key], false)
+        } else {
+            throw new Error('Invalid subnet "' + key + '".')
+        }
+    }
+}
+
 function ip2int(ip) {
     return ip.split('.').reduce(function(ipInt, octet) { return (ipInt<<8) + parseInt(octet, 10)}, 0) >>> 0;
 }
@@ -338,10 +405,8 @@ function get_property_values(subnetTree, property) {
 function get_network(networkInput, netSize) {
     let ipInt = ip2int(networkInput)
     netSize = parseInt(netSize)
-    for (let i=31-netSize; i>=0; i--) {
-        ipInt &= ~ 1<<i;
-    }
-    return int2ip(ipInt);
+    let mask = netSize === 0 ? 0 : (0xFFFFFFFF << (32 - netSize)) >>> 0
+    return int2ip((ipInt & mask) >>> 0);
 }
 
 function split_network(networkInput, netSize) {
@@ -442,12 +507,16 @@ function processConfigUrl() {
         let urlVersion = params['c'].substring(0, 1)
         let urlData = params['c'].substring(1)
         if (urlVersion === '1') {
-            let urlConfig = JSON.parse(LZString.decompressFromEncodedURIComponent(params['c'].substring(1)))
-            renameKey(urlConfig, 'v', 'config_version')
-            renameKey(urlConfig, 's', 'subnets')
-            expandKeys(urlConfig['subnets'])
-            importConfig(urlConfig)
-            return true
+            try {
+                let urlConfig = JSON.parse(LZString.decompressFromEncodedURIComponent(urlData))
+                renameKey(urlConfig, 'v', 'config_version')
+                renameKey(urlConfig, 's', 'subnets')
+                expandKeys(urlConfig['subnets'])
+                return importConfig(urlConfig)
+            } catch (e) {
+                show_warning_modal('The shared link could not be read. It may be truncated or corrupt.')
+                return false
+            }
         }
     }
 }
@@ -500,14 +569,30 @@ function renameKey(obj, oldKey, newKey) {
 }
 
 function importConfig(text) {
-    // TODO: Probably need error checking here
-    if (text['config_version'] === '1') {
-        let subnet_split = Object.keys(text['subnets'])[0].split('/')
+    try {
+        if (typeof text !== 'object' || text === null || text['config_version'] !== '1') {
+            throw new Error('Unsupported or missing config_version.')
+        }
+        validate_subnet_tree(text['subnets'], true)
+        let rootCidr = Object.keys(text['subnets'])[0]
+        let subnet_split = rootCidr.split('/')
+        if (get_network(subnet_split[0], subnet_split[1]) !== subnet_split[0]) {
+            throw new Error('Root network is not on a network boundary.')
+        }
         $('#network').val(subnet_split[0])
         $('#netsize').val(subnet_split[1])
         subnetMap = text['subnets'];
         renderTable()
+        return true
+    } catch (e) {
+        show_warning_modal('Import failed: ' + escapeHtml(e.message))
+        return false
     }
 }
 
-const rgba2hex = (rgba) => `#${rgba.match(/^rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*(\d+\.{0,1}\d*))?\)$/).slice(1).map((n, i) => (i === 3 ? Math.round(parseFloat(n) * 255) : parseFloat(n)).toString(16).padStart(2, '0').replace('NaN', '')).join('')}`
+$('#btn_aws_mode').on('click', function(event) {
+    event.preventDefault()
+    operatingMode = (operatingMode === 'AWS') ? 'NORMAL' : 'AWS'
+    $('#aws_mode_state').text(operatingMode === 'AWS' ? 'on' : 'off')
+    reset()
+})
