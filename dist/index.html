@@ -47,7 +47,7 @@
         </div>
         <div class="font-monospace col-lg-2 col-md-3 col-4">
             <div><label for="netsize" class="form-label mb-0 ms-1">Network Size</label></div>
-            <div><input id="netsize" type="text" class="form-control w-10" value="16" aria-label="Network Size" pattern="^(\d|[12]\d|30)$" required></div>
+            <div><input id="netsize" type="text" class="form-control w-10" value="16" aria-label="Network Size" pattern="^(\d|[12]\d|30)$" inputmode="numeric" required></div>
         </div>
         <div class="col-lg-2 col-md-3 col-3 font-">
             <div style="height:1.5rem"></div>
@@ -58,6 +58,12 @@
                         Tools
                     </button>
                     <ul class="dropdown-menu">
+                        <li><a class="dropdown-item" href="#" id="btn_aws_mode">AWS mode: <span id="aws_mode_state">off</span></a></li>
+                        <li><a class="dropdown-item disabled" href="#" id="btn_undo">Undo (Ctrl+Z)</a></li>
+                        <li><a class="dropdown-item disabled" href="#" id="btn_redo">Redo (Ctrl+Y)</a></li>
+                        <li><a class="dropdown-item" href="#" id="btn_netmask">Netmask column: <span id="netmask_state">off</span></a></li>
+                        <li><a class="dropdown-item" href="#" id="btn_vlsm">VLSM planner</a></li>
+                        <li><hr class="dropdown-divider"></li>
                         <li><a class="dropdown-item" href="#" data-bs-toggle="modal" data-bs-target="#importExportModal" id="btn_import_export">Import / Export</a></li>
                     </ul>
                 </div>
@@ -76,7 +82,7 @@
                 <th id="hostsHeader" style="display: table-cell;">Hosts</th>
                 <th id="noteHeader" colspan="100%" style="display: table-cell;">
                     Note
-                    <div style="display:inline-block; float:right;"><span class="split">Split</span>/<span class="join">Join</span></div>
+                    <div style="display:inline-block; float:right;"><span class="split" title="Right-click a Split cell to split into several equal subnets">Split</span>/<span class="join">Join</span></div>
                 </th>
                 <!--
                 <th id="joinHeader" colspan="100%" style="display: table-cell;"><span class="split">Split</span>/<span class="join">Join</span></th>
@@ -128,6 +134,43 @@
         </div>
     </div>
 
+    <div class="modal fade" id="vlsmModal" tabindex="-1" aria-labelledby="vlsmModalLabel" aria-hidden="true">
+        <div class="modal-dialog modal-lg modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header border-bottom-0 pb-1">
+                    <h3 class="modal-title" id="vlsmModalLabel">VLSM planner</h3>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body pt-1">
+                    <p>Enter one subnet per line as <span class="font-monospace">name, hosts</span> (or just a host count). Subnets are allocated largest-first inside <span id="vlsmRoot" class="font-monospace"></span>. This replaces the current layout (you can undo).</p>
+                    <textarea id="vlsmInput" class="form-control font-monospace" style="height: 220px" aria-label="Subnet requirements" placeholder="Sales, 120&#10;Engineering, 500&#10;Servers, 50&#10;Management, 10"></textarea>
+                    <div id="vlsmError" class="alert alert-danger mt-3 mb-0 d-none" role="alert"></div>
+                </div>
+                <div class="modal-footer border-top-0">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="button" class="btn btn-primary" id="vlsmApplyBtn">Plan</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal fade" id="splitModal" tabindex="-1" aria-labelledby="splitModalLabel" aria-hidden="true">
+        <div class="modal-dialog modal-sm modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header border-bottom-0 pb-1">
+                    <h5 class="modal-title" id="splitModalLabel">Split <span id="splitSubnetLabel" class="font-monospace"></span></h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body pt-1">
+                    <select id="splitSizeSelect" class="form-select" aria-label="Split into"></select>
+                </div>
+                <div class="modal-footer border-top-0">
+                    <button type="button" class="btn btn-primary" id="splitConfirmBtn">Split</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <div class="modal fade" id="importExportModal" tabindex="-1" aria-labelledby="importExportModalLabel" aria-hidden="true">
         <div class="modal-dialog modal-xl modal-dialog-centered">
             <div class="modal-content">
@@ -143,10 +186,15 @@
                         <textarea class="form-control pt-3" id="importExportArea" style="height: 510px"></textarea>
                         <label for="importExportArea"></label>
                     </div>
+                    <div id="importError" class="alert alert-danger mt-3 mb-0 d-none" role="alert"></div>
                 </div>
                 <div class="modal-footer">
+                    <label class="btn btn-outline-secondary mb-0">Load file<input type="file" id="importFile" accept=".json,application/json" hidden></label>
+                    <button type="button" class="btn btn-outline-secondary" id="btn_export_json">Download JSON</button>
+                    <button type="button" class="btn btn-outline-secondary" id="btn_export_csv">Download CSV</button>
+                    <button type="button" class="btn btn-outline-secondary" id="btn_copy_markdown">Copy Markdown</button>
                     <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
-                    <button type="button" class="btn btn-primary" data-bs-dismiss="modal" id="importBtn">Import</button>
+                    <button type="button" class="btn btn-primary" id="importBtn">Import</button>
                 </div>
             </div>
         </div>

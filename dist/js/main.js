@@ -2,6 +2,10 @@ let subnetMap = {};
 let subnetNotes = {};
 let maxNetSize = 0;
 let infoColumnCount = 5
+let showNetmask = false
+let undoStack = []
+let redoStack = []
+let currentSnapshot = ''
 // NORMAL mode:
 //   - Smallest subnet: /32
 //   - Two reserved addresses per subnet of size <= 30:
@@ -38,6 +42,7 @@ $('#calcbody').on('click', '.row_address, .row_range, .row_usable, .row_hosts, .
         // We could re-render here, but there is really no point, keep performant and just change the background color now
         //renderTable();
         $(this).closest('tr').css('background-color', inflightColor)
+        commit_history()
     }
 })
 
@@ -46,7 +51,16 @@ $('#btn_go').on('click', function() {
 })
 
 $('#importBtn').on('click', function() {
-    importConfig(JSON.parse($('#importExportArea').val()))
+    let parsed
+    try {
+        parsed = JSON.parse($('#importExportArea').val())
+    } catch (e) {
+        report_import_error('The pasted text is not valid JSON.')
+        return
+    }
+    if (importConfig(parsed)) {
+        bootstrap.Modal.getInstance(document.getElementById('importExportModal'))?.hide()
+    }
 })
 
 $('#bottom_nav #colors_word_open').on('click', function() {
@@ -63,8 +77,10 @@ $('#bottom_nav #colors_word_close').on('click', function() {
 })
 
 $('#bottom_nav #copy_url').on('click', function() {
-    // TODO: Provide a warning here if the URL is longer than 2000 characters, probably using a modal.
     let url = window.location.origin + getConfigUrl()
+    if (url.length > 2000) {
+        show_warning_modal('This shareable URL is ' + url.length + ' characters long. Some browsers, servers and chat tools truncate URLs over 2000 characters, so the link may not work. Use Tools &gt; Import / Export to share the design as JSON instead.')
+    }
     navigator.clipboard.writeText(url);
     $('#bottom_nav #copy_url span').text('Copied!')
     // Swap the text back after 3sec
@@ -75,6 +91,7 @@ $('#bottom_nav #copy_url').on('click', function() {
 
 
 $('#btn_import_export').on('click', function() {
+    $('#importError').addClass('d-none')
     $('#importExportArea').val(JSON.stringify(exportConfig(), null, 2))
 })
 
@@ -84,6 +101,19 @@ function reset() {
     } else {
         minSubnetSize = 32
     }
+    let maxRootSize = Math.min(30, minSubnetSize)
+    let networkValue = $('#network').val().trim()
+    let netsizeValue = $('#netsize').val().trim()
+    if (!is_valid_ipv4(networkValue)) {
+        show_warning_modal('Please enter a valid IPv4 network address, e.g. <span class="font-monospace">10.0.0.0</span>.')
+        return
+    }
+    if (!/^\d{1,2}$/.test(netsizeValue) || parseInt(netsizeValue) > maxRootSize) {
+        show_warning_modal('Network size must be a number between 0 and ' + maxRootSize + (operatingMode === 'AWS' ? ' in AWS mode.' : '.'))
+        return
+    }
+    $('#network').val(networkValue)
+    $('#netsize').val(parseInt(netsizeValue))
     let cidrInput = $('#network').val() + '/' + $('#netsize').val()
     let rootNetwork = get_network($('#network').val(), $('#netsize').val())
     let rootCidr = rootNetwork + '/' + $('#netsize').val()
@@ -94,13 +124,39 @@ function reset() {
     subnetMap = {}
     subnetMap[rootCidr] = {}
     maxNetSize = parseInt($('#netsize').val())
+    commit_history()
     renderTable();
 }
 
 $('#calcbody').on('click', 'td.split,td.join', function(event) {
     // HTML DOM Data elements! Yay! See the `data-*` attributes of the HTML tags
     mutate_subnet_map(this.dataset.mutateVerb, this.dataset.subnet, '')
+    commit_history()
     renderTable();
+})
+
+// Right-click a Split cell to split a subnet into several equal pieces at once.
+let splitTargetSubnet = ''
+$('#calcbody').on('contextmenu', 'td.split', function(event) {
+    let parts = this.dataset.subnet.split('/')
+    let netSize = parseInt(parts[1])
+    let options = ''
+    for (let bits = 1; bits <= 8 && netSize + bits <= minSubnetSize; bits++) {
+        options += '<option value="' + (netSize + bits) + '">' + (2 ** bits) + ' x /' + (netSize + bits) + '</option>'
+    }
+    if (options === '') { return }
+    event.preventDefault()
+    splitTargetSubnet = this.dataset.subnet
+    $('#splitSubnetLabel').text(splitTargetSubnet)
+    $('#splitSizeSelect').html(options)
+    bootstrap.Modal.getOrCreateInstance(document.getElementById('splitModal')).show()
+})
+
+$('#splitConfirmBtn').on('click', function() {
+    split_network_to(splitTargetSubnet, parseInt($('#splitSizeSelect').val()))
+    commit_history()
+    renderTable()
+    bootstrap.Modal.getOrCreateInstance(document.getElementById('splitModal')).hide()
 })
 
 $('#calcbody').on('keyup', 'td.note input', function(event) {
@@ -109,6 +165,7 @@ $('#calcbody').on('keyup', 'td.note input', function(event) {
     clearTimeout(noteTimeout);
     noteTimeout = setTimeout(function(element) {
         mutate_subnet_map('note', element.dataset.subnet, '', element.value)
+        commit_history()
     }, delay, this);
 })
 
@@ -116,11 +173,13 @@ $('#calcbody').on('focusout', 'td.note input', function(event) {
     // HTML DOM Data elements! Yay! See the `data-*` attributes of the HTML tags
     clearTimeout(noteTimeout);
     mutate_subnet_map('note', this.dataset.subnet, '', this.value)
+    commit_history()
 })
 
 
 function renderTable() {
-    // TODO: Validation Code
+    infoColumnCount = showNetmask ? 6 : 5
+    $('#netmaskHeader').css('display', showNetmask ? 'table-cell' : 'none')
     $('#calcbody').empty();
     let maxDepth = get_dict_max_depth(subnetMap, 0)
     addRowTree(subnetMap, 0, maxDepth)
@@ -155,9 +214,10 @@ function addRow(network, netSize, colspan, note, notesWidth, color) {
     let usableLast = subnet_usable_last(addressFirst, netSize)
     let hostCount = 1 + usableLast - usableFirst
     let styleTag = ''
-    if (color !== '') {
+    if (is_valid_color(color)) {
         styleTag = ' style="background-color: ' + color + '"'
     }
+    note = escapeHtml(note)
 
     let rangeCol, usableCol;
     if (netSize < 32) {
@@ -171,6 +231,7 @@ function addRow(network, netSize, colspan, note, notesWidth, color) {
     let newRow =
         '            <tr id="row_' + network.replace('.', '-') + '_' + netSize + '"' + styleTag + '>\n' +
         '                <td data-subnet="' + network + '/' + netSize + '" class="row_address">' + network + '/' + netSize + '</td>\n' +
+        (showNetmask ? '                <td data-subnet="' + network + '/' + netSize + '" class="row_netmask">' + netmask_text(netSize) + '</td>\n' : '') +
         '                <td data-subnet="' + network + '/' + netSize + '" class="row_range">' + rangeCol + '</td>\n' +
         '                <td data-subnet="' + network + '/' + netSize + '" class="row_usable">' + usableCol + '</td>\n' +
         '                <td data-subnet="' + network + '/' + netSize + '" class="row_hosts">' + hostCount + '</td>\n' +
@@ -196,6 +257,48 @@ function addRow(network, netSize, colspan, note, notesWidth, color) {
 
 
 // Helper Functions
+function escapeHtml(value) {
+    return String(value).replace(/[&<>"']/g, function(c) {
+        return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]
+    })
+}
+
+function is_valid_ipv4(ip) {
+    return /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/.test(ip)
+}
+
+function is_valid_cidr(cidr) {
+    if (typeof cidr !== 'string') { return false }
+    let parts = cidr.split('/')
+    return parts.length === 2 && is_valid_ipv4(parts[0]) && /^\d{1,2}$/.test(parts[1]) && parseInt(parts[1]) <= 32
+}
+
+function is_valid_color(color) {
+    return typeof color === 'string' && /^#[0-9a-fA-F]{3,8}$/.test(color)
+}
+
+// Throws if the (decoded) config tree is malformed, so bad imports/URLs can never reach the renderer.
+function validate_subnet_tree(tree, isRoot) {
+    if (typeof tree !== 'object' || tree === null || Array.isArray(tree)) {
+        throw new Error('Invalid subnet structure.')
+    }
+    let keys = Object.keys(tree)
+    if (isRoot && keys.length !== 1) {
+        throw new Error('Configuration must have exactly one root network.')
+    }
+    for (const key of keys) {
+        if (key === '_note') {
+            if (typeof tree[key] !== 'string') { throw new Error('Invalid note.') }
+        } else if (key === '_color') {
+            if (tree[key] !== '' && !is_valid_color(tree[key])) { throw new Error('Invalid color.') }
+        } else if (is_valid_cidr(key)) {
+            validate_subnet_tree(tree[key], false)
+        } else {
+            throw new Error('Invalid subnet "' + key + '".')
+        }
+    }
+}
+
 function ip2int(ip) {
     return ip.split('.').reduce(function(ipInt, octet) { return (ipInt<<8) + parseInt(octet, 10)}, 0) >>> 0;
 }
@@ -338,10 +441,8 @@ function get_property_values(subnetTree, property) {
 function get_network(networkInput, netSize) {
     let ipInt = ip2int(networkInput)
     netSize = parseInt(netSize)
-    for (let i=31-netSize; i>=0; i--) {
-        ipInt &= ~ 1<<i;
-    }
-    return int2ip(ipInt);
+    let mask = netSize === 0 ? 0 : (0xFFFFFFFF << (32 - netSize)) >>> 0
+    return int2ip((ipInt & mask) >>> 0);
 }
 
 function split_network(networkInput, netSize) {
@@ -442,12 +543,16 @@ function processConfigUrl() {
         let urlVersion = params['c'].substring(0, 1)
         let urlData = params['c'].substring(1)
         if (urlVersion === '1') {
-            let urlConfig = JSON.parse(LZString.decompressFromEncodedURIComponent(params['c'].substring(1)))
-            renameKey(urlConfig, 'v', 'config_version')
-            renameKey(urlConfig, 's', 'subnets')
-            expandKeys(urlConfig['subnets'])
-            importConfig(urlConfig)
-            return true
+            try {
+                let urlConfig = JSON.parse(LZString.decompressFromEncodedURIComponent(urlData))
+                renameKey(urlConfig, 'v', 'config_version')
+                renameKey(urlConfig, 's', 'subnets')
+                expandKeys(urlConfig['subnets'])
+                return importConfig(urlConfig)
+            } catch (e) {
+                show_warning_modal('The shared link could not be read. It may be truncated or corrupt.')
+                return false
+            }
         }
     }
 }
@@ -499,15 +604,273 @@ function renameKey(obj, oldKey, newKey) {
     }
 }
 
-function importConfig(text) {
-    // TODO: Probably need error checking here
-    if (text['config_version'] === '1') {
-        let subnet_split = Object.keys(text['subnets'])[0].split('/')
-        $('#network').val(subnet_split[0])
-        $('#netsize').val(subnet_split[1])
-        subnetMap = text['subnets'];
-        renderTable()
+// Bootstrap would stack a second modal behind the Import dialog, so show errors inline there.
+function report_import_error(message) {
+    if ($('#importExportModal').hasClass('show')) {
+        $('#importError').text(message).removeClass('d-none')
+    } else {
+        show_warning_modal(escapeHtml(message))
     }
 }
 
+function importConfig(text) {
+    try {
+        if (typeof text !== 'object' || text === null || text['config_version'] !== '1') {
+            throw new Error('Unsupported or missing config_version.')
+        }
+        validate_subnet_tree(text['subnets'], true)
+        let rootCidr = Object.keys(text['subnets'])[0]
+        let subnet_split = rootCidr.split('/')
+        if (get_network(subnet_split[0], subnet_split[1]) !== subnet_split[0]) {
+            throw new Error('Root network is not on a network boundary.')
+        }
+        $('#network').val(subnet_split[0])
+        $('#netsize').val(subnet_split[1])
+        subnetMap = text['subnets'];
+        maxNetSize = parseInt(subnet_split[1])
+        commit_history()
+        renderTable()
+        return true
+    } catch (e) {
+        report_import_error('Import failed: ' + e.message)
+        return false
+    }
+}
+
+$('#btn_aws_mode').on('click', function(event) {
+    event.preventDefault()
+    operatingMode = (operatingMode === 'AWS') ? 'NORMAL' : 'AWS'
+    $('#aws_mode_state').text(operatingMode === 'AWS' ? 'on' : 'off')
+    reset()
+})
+
 const rgba2hex = (rgba) => `#${rgba.match(/^rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*(\d+\.{0,1}\d*))?\)$/).slice(1).map((n, i) => (i === 3 ? Math.round(parseFloat(n) * 255) : parseFloat(n)).toString(16).padStart(2, '0').replace('NaN', '')).join('')}`
+
+// Netmask / wildcard column
+function netmask_text(netSize) {
+    let mask = netSize === 0 ? 0 : (0xFFFFFFFF << (32 - netSize)) >>> 0
+    return int2ip(mask) + ' / ' + int2ip(~mask >>> 0)
+}
+
+$('#btn_netmask').on('click', function(event) {
+    event.preventDefault()
+    showNetmask = !showNetmask
+    $('#netmask_state').text(showNetmask ? 'on' : 'off')
+    renderTable()
+})
+
+// Undo / redo: snapshots of the whole subnet tree
+function commit_history() {
+    let snapshot = JSON.stringify(subnetMap)
+    if (snapshot === currentSnapshot) { return }
+    if (currentSnapshot !== '') {
+        undoStack.push(currentSnapshot)
+        if (undoStack.length > 100) { undoStack.shift() }
+    }
+    currentSnapshot = snapshot
+    redoStack = []
+    update_history_buttons()
+}
+
+function restore_snapshot(snapshot) {
+    currentSnapshot = snapshot
+    subnetMap = JSON.parse(snapshot)
+    let rootSplit = Object.keys(subnetMap)[0].split('/')
+    maxNetSize = parseInt(rootSplit[1])
+    $('#network').val(rootSplit[0])
+    $('#netsize').val(rootSplit[1])
+    renderTable()
+    update_history_buttons()
+}
+
+function undo() {
+    if (undoStack.length === 0) { return }
+    redoStack.push(currentSnapshot)
+    restore_snapshot(undoStack.pop())
+}
+
+function redo() {
+    if (redoStack.length === 0) { return }
+    undoStack.push(currentSnapshot)
+    restore_snapshot(redoStack.pop())
+}
+
+function update_history_buttons() {
+    $('#btn_undo').toggleClass('disabled', undoStack.length === 0)
+    $('#btn_redo').toggleClass('disabled', redoStack.length === 0)
+}
+
+$('#btn_undo').on('click', function(event) { event.preventDefault(); undo() })
+$('#btn_redo').on('click', function(event) { event.preventDefault(); redo() })
+
+$(document).on('keydown', function(event) {
+    if (!(event.ctrlKey || event.metaKey)) { return }
+    // Leave text editing inside inputs/textareas to the browser
+    if ($(event.target).is('input, textarea')) { return }
+    let key = event.key.toLowerCase()
+    if (key === 'z' && !event.shiftKey) { event.preventDefault(); undo() }
+    else if (key === 'y' || (key === 'z' && event.shiftKey)) { event.preventDefault(); redo() }
+})
+
+// Split a subnet into equal pieces of the target size
+function split_network_to(cidr, targetSize) {
+    let level = [cidr]
+    while (level.length > 0 && parseInt(level[0].split('/')[1]) < targetSize) {
+        let next = []
+        for (const net of level) {
+            let parts = net.split('/')
+            mutate_subnet_map('split', net, '')
+            next.push(...split_network(parts[0], parseInt(parts[1])))
+        }
+        level = next
+    }
+}
+
+// Table export (CSV / Markdown / JSON file)
+function get_table_data() {
+    let rows = [['Subnet', 'Range', 'Usable', 'Hosts', 'Note']]
+    if (showNetmask) { rows[0].splice(1, 0, 'Netmask / Wildcard') }
+    $('#calcbody tr').each(function() {
+        let row = [$(this).find('.row_address').text()]
+        if (showNetmask) { row.push($(this).find('.row_netmask').text()) }
+        row.push($(this).find('.row_range').text(), $(this).find('.row_usable').text(), $(this).find('.row_hosts').text(), $(this).find('td.note input').val())
+        rows.push(row)
+    })
+    return rows
+}
+
+function to_csv(rows) {
+    return rows.map(function(row) {
+        return row.map(function(cell) {
+            cell = String(cell)
+            // Prevent spreadsheet formula injection from notes
+            if (/^[=+\-@\t\r]/.test(cell)) { cell = "'" + cell }
+            return '"' + cell.replace(/"/g, '""') + '"'
+        }).join(',')
+    }).join('\r\n') + '\r\n'
+}
+
+function to_markdown(rows) {
+    let esc = function(cell) { return String(cell).replace(/\|/g, '\\|').replace(/\r?\n/g, ' ') }
+    let lines = ['| ' + rows[0].map(esc).join(' | ') + ' |', '| ' + rows[0].map(function() { return '---' }).join(' | ') + ' |']
+    rows.slice(1).forEach(function(row) { lines.push('| ' + row.map(esc).join(' | ') + ' |') })
+    return lines.join('\n') + '\n'
+}
+
+function download_file(filename, content, mime) {
+    let url = URL.createObjectURL(new Blob([content], {type: mime}))
+    let link = document.createElement('a')
+    link.href = url
+    link.download = filename
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    URL.revokeObjectURL(url)
+}
+
+$('#btn_export_csv').on('click', function() { download_file('subnets.csv', to_csv(get_table_data()), 'text/csv') })
+$('#btn_export_json').on('click', function() { download_file('subnets.json', JSON.stringify(exportConfig(), null, 2), 'application/json') })
+$('#btn_copy_markdown').on('click', function() {
+    navigator.clipboard.writeText(to_markdown(get_table_data()))
+    $('#btn_copy_markdown').text('Copied!')
+    setTimeout(function() { $('#btn_copy_markdown').text('Copy Markdown') }, 2000)
+})
+$('#importFile').on('change', function() {
+    let file = this.files[0]
+    if (!file) { return }
+    let reader = new FileReader()
+    reader.onload = function() { $('#importExportArea').val(reader.result) }
+    reader.readAsText(file)
+    this.value = ''
+})
+
+// VLSM planner: allocate subnets for a list of host requirements inside the current root network
+function usable_hosts(netSize) {
+    let total = 2 ** (32 - netSize)
+    if (netSize >= 31) { return total }
+    return total - (operatingMode === 'AWS' ? 5 : 2)
+}
+
+function parse_vlsm_requests(text) {
+    let requests = []
+    let lines = text.split(/\r?\n/)
+    for (let i = 0; i < lines.length; i++) {
+        let line = lines[i].trim()
+        if (line === '') { continue }
+        let match = line.match(/^(?:(.*?)\s*[,:\t]\s*)?(\d+)$/)
+        if (!match) { throw new Error('Line ' + (i + 1) + ' is not "name, hosts" or a host count.') }
+        let hosts = parseInt(match[2])
+        if (hosts < 1 || hosts > 2 ** 32) { throw new Error('Line ' + (i + 1) + ': host count out of range.') }
+        requests.push({name: match[1] || '', hosts: hosts})
+    }
+    if (requests.length === 0) { throw new Error('Enter at least one subnet requirement.') }
+    if (requests.length > 500) { throw new Error('Too many subnets (max 500).') }
+    return requests
+}
+
+function build_vlsm_tree(rootAddr, rootSize, requests) {
+    let sized = requests.map(function(req, index) {
+        let prefix = -1
+        for (let candidate = Math.min(minSubnetSize, 32); candidate >= rootSize; candidate--) {
+            if (usable_hosts(candidate) >= req.hosts) { prefix = candidate; break }
+        }
+        if (prefix === -1) { throw new Error('"' + (req.name || req.hosts + ' hosts') + '" needs more hosts than this network can hold.') }
+        return {prefix: prefix, name: req.name, hosts: req.hosts, index: index}
+    })
+    // Largest first keeps every block naturally aligned and leaves no gaps
+    sized.sort(function(a, b) { return a.prefix - b.prefix || a.index - b.index })
+    let leaves = {}
+    let cursor = rootAddr
+    let end = rootAddr + 2 ** (32 - rootSize)
+    for (const item of sized) {
+        let size = 2 ** (32 - item.prefix)
+        if (cursor + size > end) { throw new Error('The requested subnets do not fit in ' + int2ip(rootAddr) + '/' + rootSize + '.') }
+        let note = item.name ? item.name + ' (' + item.hosts + ' hosts)' : item.hosts + ' hosts'
+        leaves[int2ip(cursor) + '/' + item.prefix] = note
+        cursor += size
+    }
+    // Remaining space becomes maximal aligned free blocks
+    while (cursor < end) {
+        let size = 1
+        while (cursor % (size * 2) === 0 && cursor + size * 2 <= end) { size *= 2 }
+        leaves[int2ip(cursor) + '/' + (32 - Math.log2(size))] = ''
+        cursor += size
+    }
+    let build = function(addr, size) {
+        let cidr = int2ip(addr) + '/' + size
+        if (cidr in leaves) {
+            return leaves[cidr] === '' ? {} : {'_note': leaves[cidr]}
+        }
+        let half = 2 ** (32 - size - 1)
+        let node = {}
+        node[int2ip(addr) + '/' + (size + 1)] = build(addr, size + 1)
+        node[int2ip(addr + half) + '/' + (size + 1)] = build(addr + half, size + 1)
+        return node
+    }
+    let tree = {}
+    tree[int2ip(rootAddr) + '/' + rootSize] = build(rootAddr, rootSize)
+    return tree
+}
+
+$('#btn_vlsm').on('click', function(event) {
+    event.preventDefault()
+    let rootCidr = Object.keys(subnetMap)[0]
+    $('#vlsmRoot').text(rootCidr)
+    $('#vlsmError').addClass('d-none')
+    bootstrap.Modal.getOrCreateInstance(document.getElementById('vlsmModal')).show()
+})
+
+$('#vlsmApplyBtn').on('click', function() {
+    try {
+        let rootSplit = Object.keys(subnetMap)[0].split('/')
+        let requests = parse_vlsm_requests($('#vlsmInput').val())
+        let tree = build_vlsm_tree(ip2int(rootSplit[0]), parseInt(rootSplit[1]), requests)
+        validate_subnet_tree(tree, true)
+        subnetMap = tree
+        commit_history()
+        renderTable()
+        bootstrap.Modal.getOrCreateInstance(document.getElementById('vlsmModal')).hide()
+    } catch (e) {
+        $('#vlsmError').text(e.message).removeClass('d-none')
+    }
+})
