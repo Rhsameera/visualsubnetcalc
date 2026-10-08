@@ -771,3 +771,94 @@ $('#importFile').on('change', function() {
     reader.readAsText(file)
     this.value = ''
 })
+
+// VLSM planner: allocate subnets for a list of host requirements inside the current root network
+function usable_hosts(netSize) {
+    let total = 2 ** (32 - netSize)
+    if (netSize >= 31) { return total }
+    return total - (operatingMode === 'AWS' ? 5 : 2)
+}
+
+function parse_vlsm_requests(text) {
+    let requests = []
+    let lines = text.split(/\r?\n/)
+    for (let i = 0; i < lines.length; i++) {
+        let line = lines[i].trim()
+        if (line === '') { continue }
+        let match = line.match(/^(?:(.*?)\s*[,:\t]\s*)?(\d+)$/)
+        if (!match) { throw new Error('Line ' + (i + 1) + ' is not "name, hosts" or a host count.') }
+        let hosts = parseInt(match[2])
+        if (hosts < 1 || hosts > 2 ** 32) { throw new Error('Line ' + (i + 1) + ': host count out of range.') }
+        requests.push({name: match[1] || '', hosts: hosts})
+    }
+    if (requests.length === 0) { throw new Error('Enter at least one subnet requirement.') }
+    if (requests.length > 500) { throw new Error('Too many subnets (max 500).') }
+    return requests
+}
+
+function build_vlsm_tree(rootAddr, rootSize, requests) {
+    let sized = requests.map(function(req, index) {
+        let prefix = -1
+        for (let candidate = Math.min(minSubnetSize, 32); candidate >= rootSize; candidate--) {
+            if (usable_hosts(candidate) >= req.hosts) { prefix = candidate; break }
+        }
+        if (prefix === -1) { throw new Error('"' + (req.name || req.hosts + ' hosts') + '" needs more hosts than this network can hold.') }
+        return {prefix: prefix, name: req.name, hosts: req.hosts, index: index}
+    })
+    // Largest first keeps every block naturally aligned and leaves no gaps
+    sized.sort(function(a, b) { return a.prefix - b.prefix || a.index - b.index })
+    let leaves = {}
+    let cursor = rootAddr
+    let end = rootAddr + 2 ** (32 - rootSize)
+    for (const item of sized) {
+        let size = 2 ** (32 - item.prefix)
+        if (cursor + size > end) { throw new Error('The requested subnets do not fit in ' + int2ip(rootAddr) + '/' + rootSize + '.') }
+        let note = item.name ? item.name + ' (' + item.hosts + ' hosts)' : item.hosts + ' hosts'
+        leaves[int2ip(cursor) + '/' + item.prefix] = note
+        cursor += size
+    }
+    // Remaining space becomes maximal aligned free blocks
+    while (cursor < end) {
+        let size = 1
+        while (cursor % (size * 2) === 0 && cursor + size * 2 <= end) { size *= 2 }
+        leaves[int2ip(cursor) + '/' + (32 - Math.log2(size))] = ''
+        cursor += size
+    }
+    let build = function(addr, size) {
+        let cidr = int2ip(addr) + '/' + size
+        if (cidr in leaves) {
+            return leaves[cidr] === '' ? {} : {'_note': leaves[cidr]}
+        }
+        let half = 2 ** (32 - size - 1)
+        let node = {}
+        node[int2ip(addr) + '/' + (size + 1)] = build(addr, size + 1)
+        node[int2ip(addr + half) + '/' + (size + 1)] = build(addr + half, size + 1)
+        return node
+    }
+    let tree = {}
+    tree[int2ip(rootAddr) + '/' + rootSize] = build(rootAddr, rootSize)
+    return tree
+}
+
+$('#btn_vlsm').on('click', function(event) {
+    event.preventDefault()
+    let rootCidr = Object.keys(subnetMap)[0]
+    $('#vlsmRoot').text(rootCidr)
+    $('#vlsmError').addClass('d-none')
+    bootstrap.Modal.getOrCreateInstance(document.getElementById('vlsmModal')).show()
+})
+
+$('#vlsmApplyBtn').on('click', function() {
+    try {
+        let rootSplit = Object.keys(subnetMap)[0].split('/')
+        let requests = parse_vlsm_requests($('#vlsmInput').val())
+        let tree = build_vlsm_tree(ip2int(rootSplit[0]), parseInt(rootSplit[1]), requests)
+        validate_subnet_tree(tree, true)
+        subnetMap = tree
+        commit_history()
+        renderTable()
+        bootstrap.Modal.getOrCreateInstance(document.getElementById('vlsmModal')).hide()
+    } catch (e) {
+        $('#vlsmError').text(e.message).removeClass('d-none')
+    }
+})
